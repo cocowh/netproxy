@@ -4,18 +4,24 @@ package app
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cocowh/netproxy/internal/core/admin"
 	"github.com/cocowh/netproxy/internal/core/config"
 	"github.com/cocowh/netproxy/internal/core/lifecycle"
 	"github.com/cocowh/netproxy/internal/core/logger"
 	"github.com/cocowh/netproxy/internal/feature/acl"
+	"github.com/cocowh/netproxy/internal/feature/acme"
 	"github.com/cocowh/netproxy/internal/feature/auth"
 	"github.com/cocowh/netproxy/internal/feature/dns"
+	"github.com/cocowh/netproxy/internal/feature/health"
 	"github.com/cocowh/netproxy/internal/feature/loadbalancer"
+	"github.com/cocowh/netproxy/internal/feature/metrics"
 	"github.com/cocowh/netproxy/internal/feature/ratelimit"
 	"github.com/cocowh/netproxy/internal/feature/router"
 	"github.com/cocowh/netproxy/internal/feature/stats"
+	"github.com/cocowh/netproxy/internal/feature/subscription"
+	"github.com/cocowh/netproxy/internal/feature/user"
 	"github.com/cocowh/netproxy/internal/protocol/http"
 	"github.com/cocowh/netproxy/internal/protocol/socks5"
 	"github.com/cocowh/netproxy/internal/protocol/sps"
@@ -27,13 +33,18 @@ import (
 
 // App represents the main application instance
 type App struct {
-	cfgManager     config.Manager
-	cfg            *config.Config
-	logger         logger.Logger
-	lifecycle      lifecycle.Lifecycle
-	router         router.Router
-	statsCollector stats.StatsCollector
-	authenticator  auth.Authenticator
+	cfgManager        config.Manager
+	cfg               *config.Config
+	logger            logger.Logger
+	lifecycle         lifecycle.Lifecycle
+	router            router.Router
+	statsCollector    stats.StatsCollector
+	authenticator     auth.Authenticator
+	userStore         user.Store
+	metricsCollector  *metrics.Collector
+	healthChecker     *health.Checker
+	acmeManager       *acme.Manager
+	subscriptionUpdater *subscription.Updater
 }
 
 // New creates a new App instance with the given config file path
@@ -62,6 +73,25 @@ func New(cfgFile string) (*App, error) {
 	// 6. Init Auth
 	app.initAuth()
 
+	// 7. Init User Store (if enabled)
+	if err := app.initUserStore(); err != nil {
+		return nil, fmt.Errorf("failed to init user store: %w", err)
+	}
+
+	// 8. Init Metrics Collector (if enabled)
+	app.initMetricsCollector()
+
+	// 9. Init Health Checker (if enabled)
+	app.initHealthChecker()
+
+	// 10. Init ACME Manager (if enabled)
+	if err := app.initACMEManager(); err != nil {
+		return nil, fmt.Errorf("failed to init ACME manager: %w", err)
+	}
+
+	// 11. Init Subscription Updater (if enabled)
+	app.initSubscriptionUpdater()
+
 	return app, nil
 }
 
@@ -84,14 +114,33 @@ func (a *App) Run(ctx context.Context) error {
 	// Init Tunnel
 	a.initTunnel()
 
+	// Init Health Checker lifecycle hook
+	a.initHealthCheckerHook()
+
+	// Init ACME Manager lifecycle hook
+	a.initACMEManagerHook()
+
+	// Init Subscription Updater lifecycle hook
+	a.initSubscriptionUpdaterHook()
+
 	// Run and wait for shutdown
 	if err := lifecycle.RunAndWait(ctx, a.lifecycle); err != nil {
 		a.logger.Fatal("Application error", logger.Any("error", err))
 		return err
 	}
 
+	// Cleanup
+	a.cleanup()
+
 	a.logger.Info("NetProxy stopped")
 	return nil
+}
+
+// cleanup performs cleanup operations on shutdown
+func (a *App) cleanup() {
+	if a.userStore != nil {
+		a.userStore.Close()
+	}
 }
 
 // initConfig loads the configuration
@@ -406,4 +455,256 @@ func (a *App) initTunnelClient() {
 			return nil
 		},
 	})
+}
+
+// initUserStore initializes the user store if enabled
+func (a *App) initUserStore() error {
+	if !a.cfg.Users.Enabled {
+		return nil
+	}
+
+	var store user.Store
+	var err error
+
+	switch a.cfg.Users.StoreType {
+	case "sqlite":
+		store, err = user.NewSQLiteStore(a.cfg.Users.SQLitePath)
+		if err != nil {
+			return fmt.Errorf("failed to create SQLite store: %w", err)
+		}
+	default:
+		store = user.NewMemoryStore()
+	}
+
+	a.userStore = store
+	a.logger.Info("User store initialized", logger.Any("type", a.cfg.Users.StoreType))
+	return nil
+}
+
+// initMetricsCollector initializes the metrics collector if enabled
+func (a *App) initMetricsCollector() {
+	if !a.cfg.Metrics.Enabled {
+		return
+	}
+
+	a.metricsCollector = metrics.NewCollector()
+	a.logger.Info("Metrics collector initialized")
+}
+
+// initHealthChecker initializes the health checker if enabled
+func (a *App) initHealthChecker() {
+	if !a.cfg.Health.Enabled {
+		return
+	}
+
+	interval := a.cfg.Health.Interval
+	if interval == 0 {
+		interval = 30 * time.Second
+	}
+
+	defaultTimeout := a.cfg.Health.DefaultTimeout
+	if defaultTimeout == 0 {
+		defaultTimeout = 5 * time.Second
+	}
+
+	a.healthChecker = health.NewChecker(health.Config{
+		Interval:       interval,
+		DefaultTimeout: defaultTimeout,
+	})
+
+	// Register default health checks
+	a.healthChecker.Register(&health.Component{
+		Name:     "memory",
+		Check:    health.MemoryCheck(80),
+		Critical: false,
+		Timeout:  defaultTimeout,
+	})
+
+	a.healthChecker.Register(&health.Component{
+		Name:     "goroutines",
+		Check:    health.GoroutineCheck(10000),
+		Critical: false,
+		Timeout:  defaultTimeout,
+	})
+
+	a.logger.Info("Health checker initialized")
+}
+
+// initHealthCheckerHook registers the health checker lifecycle hook
+func (a *App) initHealthCheckerHook() {
+	if a.healthChecker == nil {
+		return
+	}
+
+	a.lifecycle.Append(lifecycle.Hook{
+		Name: "HealthChecker",
+		OnStart: func(ctx context.Context) error {
+			a.logger.Info("Starting Health Checker")
+			return a.healthChecker.Start(ctx)
+		},
+		OnStop: func(ctx context.Context) error {
+			return a.healthChecker.Stop()
+		},
+	})
+}
+
+// initACMEManager initializes the ACME certificate manager if enabled
+func (a *App) initACMEManager() error {
+	if !a.cfg.ACME.Enabled {
+		return nil
+	}
+
+	cacheDir := a.cfg.ACME.CacheDir
+	if cacheDir == "" {
+		cacheDir = "./data/acme"
+	}
+
+	directoryURL := a.cfg.ACME.DirectoryURL
+	if directoryURL == "" {
+		directoryURL = "https://acme-v02.api.letsencrypt.org/directory"
+	}
+
+	renewBefore := a.cfg.ACME.RenewBefore
+	if renewBefore == 0 {
+		renewBefore = 30 * 24 * time.Hour
+	}
+
+	httpChallengePort := a.cfg.ACME.HTTPChallengePort
+	if httpChallengePort == 0 {
+		httpChallengePort = 80
+	}
+
+	tlsChallengePort := a.cfg.ACME.TLSChallengePort
+	if tlsChallengePort == 0 {
+		tlsChallengePort = 443
+	}
+
+	manager, err := acme.NewManager(acme.Config{
+		Email:             a.cfg.ACME.Email,
+		Domains:           a.cfg.ACME.Domains,
+		CacheDir:          cacheDir,
+		DirectoryURL:      directoryURL,
+		RenewBefore:       renewBefore,
+		HTTPChallenge:     a.cfg.ACME.HTTPChallenge,
+		HTTPChallengePort: httpChallengePort,
+		TLSChallenge:      a.cfg.ACME.TLSChallenge,
+		TLSChallengePort:  tlsChallengePort,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create ACME manager: %w", err)
+	}
+
+	a.acmeManager = manager
+	a.logger.Info("ACME manager initialized", logger.Any("domains", a.cfg.ACME.Domains))
+	return nil
+}
+
+// initACMEManagerHook registers the ACME manager lifecycle hook
+func (a *App) initACMEManagerHook() {
+	if a.acmeManager == nil {
+		return
+	}
+
+	a.lifecycle.Append(lifecycle.Hook{
+		Name: "ACMEManager",
+		OnStart: func(ctx context.Context) error {
+			a.logger.Info("Starting ACME Manager")
+			return a.acmeManager.Start(ctx)
+		},
+		OnStop: func(ctx context.Context) error {
+			return a.acmeManager.Stop()
+		},
+	})
+}
+
+// initSubscriptionUpdater initializes the subscription updater if enabled
+func (a *App) initSubscriptionUpdater() {
+	if !a.cfg.Subscription.Enabled || len(a.cfg.Subscription.Sources) == 0 {
+		return
+	}
+
+	sources := make([]*subscription.RuleSource, 0, len(a.cfg.Subscription.Sources))
+	for _, src := range a.cfg.Subscription.Sources {
+		if !src.Enabled {
+			continue
+		}
+
+		ruleType := subscription.RuleTypeCustom
+		switch src.Type {
+		case "geoip":
+			ruleType = subscription.RuleTypeGeoIP
+		case "geosite":
+			ruleType = subscription.RuleTypeGeoSite
+		default:
+			ruleType = subscription.RuleTypeCustom
+		}
+
+		updateInterval := src.UpdateInterval
+		if updateInterval == 0 {
+			updateInterval = 24 * time.Hour
+		}
+
+		sources = append(sources, &subscription.RuleSource{
+			Name:           src.Name,
+			Type:           ruleType,
+			URL:            src.URL,
+			LocalPath:      src.LocalPath,
+			UpdateInterval: updateInterval,
+			Enabled:        src.Enabled,
+		})
+	}
+
+	if len(sources) == 0 {
+		return
+	}
+
+	updater, err := subscription.NewUpdater(subscription.Config{
+		DataDir: "./data/rules",
+		Sources: sources,
+	})
+	if err != nil {
+		a.logger.Error("Failed to create subscription updater", logger.Any("error", err))
+		return
+	}
+
+	a.subscriptionUpdater = updater
+	a.logger.Info("Subscription updater initialized", logger.Any("sources", len(sources)))
+}
+
+// initSubscriptionUpdaterHook registers the subscription updater lifecycle hook
+func (a *App) initSubscriptionUpdaterHook() {
+	if a.subscriptionUpdater == nil {
+		return
+	}
+
+	a.lifecycle.Append(lifecycle.Hook{
+		Name: "SubscriptionUpdater",
+		OnStart: func(ctx context.Context) error {
+			a.logger.Info("Starting Subscription Updater")
+			return a.subscriptionUpdater.Start(ctx)
+		},
+		OnStop: func(ctx context.Context) error {
+			return a.subscriptionUpdater.Stop()
+		},
+	})
+}
+
+// GetUserStore returns the user store (for API handlers)
+func (a *App) GetUserStore() user.Store {
+	return a.userStore
+}
+
+// GetMetricsCollector returns the metrics collector (for API handlers)
+func (a *App) GetMetricsCollector() *metrics.Collector {
+	return a.metricsCollector
+}
+
+// GetHealthChecker returns the health checker (for API handlers)
+func (a *App) GetHealthChecker() *health.Checker {
+	return a.healthChecker
+}
+
+// GetSubscriptionUpdater returns the subscription updater (for API handlers)
+func (a *App) GetSubscriptionUpdater() *subscription.Updater {
+	return a.subscriptionUpdater
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
@@ -12,14 +13,98 @@ import (
 
 // Config holds the global configuration
 type Config struct {
-	Listeners []ListenerConfig       `mapstructure:"listeners"`
-	Log       LogConfig              `mapstructure:"log"`
-	Auth      AuthConfig             `mapstructure:"auth"`
-	DNS       DNSConfig              `mapstructure:"dns"`
-	Modules   map[string]interface{} `mapstructure:"modules"`
-	Tunnel    TunnelConfig           `mapstructure:"tunnel"`
-	Routing   RoutingConfig          `mapstructure:"routing"`
-	Admin     AdminConfig            `mapstructure:"admin"`
+	Listeners    []ListenerConfig       `mapstructure:"listeners"`
+	Log          LogConfig              `mapstructure:"log"`
+	Auth         AuthConfig             `mapstructure:"auth"`
+	DNS          DNSConfig              `mapstructure:"dns"`
+	Modules      map[string]interface{} `mapstructure:"modules"`
+	Tunnel       TunnelConfig           `mapstructure:"tunnel"`
+	Routing      RoutingConfig          `mapstructure:"routing"`
+	Admin        AdminConfig            `mapstructure:"admin"`
+	Users        UsersConfig            `mapstructure:"users"`
+	TUN          TUNConfig              `mapstructure:"tun"`
+	TPROXY       TPROXYConfig           `mapstructure:"tproxy"`
+	FakeDNS      FakeDNSConfig          `mapstructure:"fakedns"`
+	ACME         ACMEConfig             `mapstructure:"acme"`
+	Health       HealthConfig           `mapstructure:"health"`
+	Metrics      MetricsConfig          `mapstructure:"metrics"`
+	Subscription SubscriptionConfig     `mapstructure:"subscription"`
+}
+
+// UsersConfig holds user management configuration
+type UsersConfig struct {
+	Enabled     bool   `mapstructure:"enabled"`
+	StoreType   string `mapstructure:"store_type"`   // "memory" or "sqlite"
+	SQLitePath  string `mapstructure:"sqlite_path"`  // Path to SQLite database
+	DefaultQuota int64 `mapstructure:"default_quota"` // Default traffic quota in bytes
+}
+
+// TUNConfig holds TUN device configuration
+type TUNConfig struct {
+	Enabled bool     `mapstructure:"enabled"`
+	Name    string   `mapstructure:"name"`    // Device name (e.g., "tun0" or "utun0")
+	MTU     int      `mapstructure:"mtu"`     // MTU size
+	Address string   `mapstructure:"address"` // IP address (e.g., "10.0.0.1/24")
+	Gateway string   `mapstructure:"gateway"` // Gateway address
+	Routes  []string `mapstructure:"routes"`  // Routes to add
+}
+
+// TPROXYConfig holds transparent proxy configuration
+type TPROXYConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Addr    string `mapstructure:"addr"`     // Listen address
+	Mark    int    `mapstructure:"mark"`     // Firewall mark for routing
+	Table   int    `mapstructure:"table"`    // Routing table number
+}
+
+// FakeDNSConfig holds FakeDNS configuration
+type FakeDNSConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	IPRange  string `mapstructure:"ip_range"`  // IP range for fake IPs (e.g., "198.18.0.0/16")
+	PoolSize int    `mapstructure:"pool_size"` // Size of IP pool
+}
+
+// ACMEConfig holds ACME certificate configuration
+type ACMEConfig struct {
+	Enabled           bool          `mapstructure:"enabled"`
+	Email             string        `mapstructure:"email"`
+	Domains           []string      `mapstructure:"domains"`
+	CacheDir          string        `mapstructure:"cache_dir"`
+	DirectoryURL      string        `mapstructure:"directory_url"`
+	RenewBefore       time.Duration `mapstructure:"renew_before"`
+	HTTPChallenge     bool          `mapstructure:"http_challenge"`
+	HTTPChallengePort int           `mapstructure:"http_challenge_port"`
+	TLSChallenge      bool          `mapstructure:"tls_challenge"`
+	TLSChallengePort  int           `mapstructure:"tls_challenge_port"`
+}
+
+// HealthConfig holds health check configuration
+type HealthConfig struct {
+	Enabled        bool          `mapstructure:"enabled"`
+	Interval       time.Duration `mapstructure:"interval"`
+	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
+}
+
+// MetricsConfig holds metrics configuration
+type MetricsConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Addr    string `mapstructure:"addr"` // Prometheus metrics endpoint address
+}
+
+// SubscriptionConfig holds subscription update configuration
+type SubscriptionConfig struct {
+	Enabled bool                     `mapstructure:"enabled"`
+	Sources []SubscriptionSourceConfig `mapstructure:"sources"`
+}
+
+// SubscriptionSourceConfig holds a single subscription source configuration
+type SubscriptionSourceConfig struct {
+	Name           string        `mapstructure:"name"`
+	Type           string        `mapstructure:"type"`            // "geoip", "geosite", "rules"
+	URL            string        `mapstructure:"url"`
+	LocalPath      string        `mapstructure:"local_path"`
+	UpdateInterval time.Duration `mapstructure:"update_interval"`
+	Enabled        bool          `mapstructure:"enabled"`
 }
 
 type AdminConfig struct {
