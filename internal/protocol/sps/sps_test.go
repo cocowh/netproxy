@@ -59,8 +59,8 @@ func (m *MockHandler) Handle(ctx context.Context, conn net.Conn) error {
 
 func TestSPSHandler(t *testing.T) {
 	tests := []struct {
-		name           string
-		input          []byte
+		name            string
+		input           []byte
 		expectedHandler string
 	}{
 		{
@@ -96,7 +96,8 @@ func TestSPSHandler(t *testing.T) {
 			socks5Handler := &MockHandler{name: "socks5"}
 			defaultHandler := &MockHandler{name: "default"}
 
-			sps := NewSPSHandler(httpHandler, socks5Handler, defaultHandler)
+			// NewSPSHandler(socks5, http, def) - correct order
+			sps := NewSPSHandler(socks5Handler, httpHandler, defaultHandler)
 			conn := NewMockConn(tt.input)
 
 			err := sps.Handle(context.Background(), conn)
@@ -120,10 +121,14 @@ func TestSPSHandler(t *testing.T) {
 func TestSPSUDP(t *testing.T) {
 	// Test that UDP connection bypasses sniffing and goes to SOCKS5
 	socks5Handler := &MockHandler{name: "socks5"}
-	sps := NewSPSHandler(nil, socks5Handler, nil)
+	httpHandler := &MockHandler{name: "http"}
+	defaultHandler := &MockHandler{name: "default"}
 
-	// Fix: Initialize MockConn fully using NewMockConn, then override remote
-	conn := NewMockConn([]byte{})
+	// NewSPSHandler(socks5, http, def) - correct order
+	sps := NewSPSHandler(socks5Handler, httpHandler, defaultHandler)
+
+	// Create MockConn with UDP remote address
+	conn := NewMockConn([]byte{0x05, 0x01, 0x00}) // SOCKS5 data
 	conn.remote = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345}
 
 	err := sps.Handle(context.Background(), conn)
@@ -133,5 +138,76 @@ func TestSPSUDP(t *testing.T) {
 
 	if !socks5Handler.called {
 		t.Error("Expected SOCKS5 handler to be called for UDP")
+	}
+}
+
+func TestIsHTTPMethod(t *testing.T) {
+	tests := []struct {
+		input    []byte
+		expected bool
+	}{
+		{[]byte("GET"), true},
+		{[]byte("POS"), true},
+		{[]byte("PUT"), true},
+		{[]byte("DEL"), true},
+		{[]byte("HEA"), true},
+		{[]byte("OPT"), true},
+		{[]byte("CON"), true},
+		{[]byte("TRA"), true},
+		{[]byte("PAT"), true},
+		{[]byte{0x05, 0x01, 0x00}, false}, // SOCKS5
+		{[]byte("SSH"), false},
+		{[]byte("AB"), false}, // Too short
+	}
+
+	for _, tt := range tests {
+		result := isHTTPMethod(tt.input)
+		if result != tt.expected {
+			t.Errorf("isHTTPMethod(%v) = %v, expected %v", tt.input, result, tt.expected)
+		}
+	}
+}
+
+func TestPeekedConn(t *testing.T) {
+	data := []byte("Hello, World!")
+	conn := NewMockConn(data)
+	peeked := newPeekedConn(conn)
+
+	// Peek should not consume data
+	p1, err := peeked.Peek(5)
+	if err != nil {
+		t.Fatalf("Peek failed: %v", err)
+	}
+	if string(p1) != "Hello" {
+		t.Errorf("Expected 'Hello', got '%s'", p1)
+	}
+
+	// Peek again should return same data
+	p2, err := peeked.Peek(5)
+	if err != nil {
+		t.Fatalf("Peek failed: %v", err)
+	}
+	if string(p2) != "Hello" {
+		t.Errorf("Expected 'Hello', got '%s'", p2)
+	}
+
+	// Read should consume data
+	buf := make([]byte, 5)
+	n, err := peeked.Read(buf)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if n != 5 || string(buf) != "Hello" {
+		t.Errorf("Expected 'Hello', got '%s'", buf[:n])
+	}
+
+	// Next read should get remaining data
+	buf2 := make([]byte, 10)
+	n2, err := peeked.Read(buf2)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(buf2[:n2]) != ", World!" {
+		t.Errorf("Expected ', World!', got '%s'", buf2[:n2])
 	}
 }

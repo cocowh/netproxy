@@ -98,44 +98,126 @@ func (h *socks5Handler) handleSocks5(ctx context.Context, conn net.Conn) error {
 
 func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, atyp byte) error {
 	// Parse Address
-	var targetAddr string
-	switch atyp {
-	case 1: // IPv4
-		buf := make([]byte, 6) // IP(4) + Port(2)
-		if _, err := io.ReadFull(conn, buf); err != nil { return err }
-		ip := net.IP(buf[:4])
-		port := int(buf[4])<<8 | int(buf[5])
-		targetAddr = fmt.Sprintf("%s:%d", ip, port)
-	case 3: // Domain
-		lenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, lenBuf); err != nil { return err }
-		length := int(lenBuf[0])
-		buf := make([]byte, length+2)
-		if _, err := io.ReadFull(conn, buf); err != nil { return err }
-		domain := string(buf[:length])
-		port := int(buf[length])<<8 | int(buf[length+1])
-		targetAddr = fmt.Sprintf("%s:%d", domain, port)
-	default:
-		return fmt.Errorf("unsupported address type: %d", atyp)
+	targetAddr, isIPv6, err := h.parseAddress(conn, atyp)
+	if err != nil {
+		return err
 	}
-	
+
 	// Dial Target
 	dialer, ok := ctx.Value(nctx.CtxKeyDialer).(transport.ProxyDialer)
 	if !ok {
 		dialer = &transport.DirectDialer{}
 	}
-	
+
 	destConn, err := dialer.Dial(ctx, "tcp", targetAddr)
 	if err != nil {
-		// Reply failure
-		conn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0}) // Host unreachable
+		// Reply failure with appropriate address type
+		if isIPv6 {
+			// IPv6 failure response: VER REP RSV ATYP(4) ADDR(16) PORT(2)
+			reply := make([]byte, 22)
+			reply[0] = 5 // VER
+			reply[1] = 4 // Host unreachable
+			reply[2] = 0 // RSV
+			reply[3] = 4 // ATYP IPv6
+			// Rest is zeros (bind address)
+			conn.Write(reply)
+		} else {
+			conn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0}) // Host unreachable (IPv4)
+		}
 		return err
 	}
 	defer destConn.Close()
-	// Reply success
-	// We should return bound address, but 0.0.0.0:0 is often accepted
-	conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
-	
+
+	// Reply success with bound address
+	reply := h.buildSuccessReply(destConn.LocalAddr())
+	conn.Write(reply)
+
 	// Relay
 	return transport.Relay(conn, destConn)
+}
+
+// parseAddress parses the target address from SOCKS5 request.
+// Returns the address string, whether it's IPv6, and any error.
+func (h *socks5Handler) parseAddress(conn net.Conn, atyp byte) (string, bool, error) {
+	switch atyp {
+	case 1: // IPv4
+		buf := make([]byte, 6) // IP(4) + Port(2)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", false, err
+		}
+		ip := net.IP(buf[:4])
+		port := int(buf[4])<<8 | int(buf[5])
+		return fmt.Sprintf("%s:%d", ip, port), false, nil
+
+	case 3: // Domain
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return "", false, err
+		}
+		length := int(lenBuf[0])
+		buf := make([]byte, length+2)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", false, err
+		}
+		domain := string(buf[:length])
+		port := int(buf[length])<<8 | int(buf[length+1])
+		return fmt.Sprintf("%s:%d", domain, port), false, nil
+
+	case 4: // IPv6
+		buf := make([]byte, 18) // IP(16) + Port(2)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", true, err
+		}
+		ip := net.IP(buf[:16])
+		port := int(buf[16])<<8 | int(buf[17])
+		return fmt.Sprintf("[%s]:%d", ip, port), true, nil
+
+	default:
+		// Send address type not supported error
+		conn.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0}) // Address type not supported
+		return "", false, fmt.Errorf("unsupported address type: %d", atyp)
+	}
+}
+
+// buildSuccessReply builds a SOCKS5 success reply with the bound address.
+func (h *socks5Handler) buildSuccessReply(localAddr net.Addr) []byte {
+	// Default IPv4 reply
+	reply := []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+
+	if localAddr == nil {
+		return reply
+	}
+
+	tcpAddr, ok := localAddr.(*net.TCPAddr)
+	if !ok {
+		return reply
+	}
+
+	ip := tcpAddr.IP
+	port := tcpAddr.Port
+
+	// Check if IPv6
+	if ip4 := ip.To4(); ip4 != nil {
+		// IPv4
+		reply = make([]byte, 10)
+		reply[0] = 5 // VER
+		reply[1] = 0 // REP (success)
+		reply[2] = 0 // RSV
+		reply[3] = 1 // ATYP (IPv4)
+		copy(reply[4:8], ip4)
+		reply[8] = byte(port >> 8)
+		reply[9] = byte(port)
+	} else if len(ip) == net.IPv6len {
+		// IPv6
+		reply = make([]byte, 22)
+		reply[0] = 5 // VER
+		reply[1] = 0 // REP (success)
+		reply[2] = 0 // RSV
+		reply[3] = 4 // ATYP (IPv6)
+		copy(reply[4:20], ip)
+		reply[20] = byte(port >> 8)
+		reply[21] = byte(port)
+	}
+
+	return reply
 }

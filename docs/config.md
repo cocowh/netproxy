@@ -15,6 +15,14 @@
   - [路由配置 (routing)](#路由配置-routing)
   - [隧道配置 (tunnel)](#隧道配置-tunnel)
   - [管理接口配置 (admin)](#管理接口配置-admin)
+  - [用户管理配置 (users)](#用户管理配置-users)
+  - [透明代理配置 (tproxy)](#透明代理配置-tproxy)
+  - [TUN 设备配置 (tun)](#tun-设备配置-tun)
+  - [FakeDNS 配置 (fakedns)](#fakedns-配置-fakedns)
+  - [ACME 证书配置 (acme)](#acme-证书配置-acme)
+  - [健康检查配置 (health)](#健康检查配置-health)
+  - [订阅更新配置 (subscription)](#订阅更新配置-subscription)
+  - [指标配置 (metrics)](#指标配置-metrics)
 - [环境变量](#环境变量)
 - [热更新](#热更新)
 
@@ -92,6 +100,15 @@ listeners:
     options:
       path: "/proxy"
 
+  # KCP 传输 (低延迟 UDP)
+  - protocol: socks5
+    transport: kcp
+    addr: ":4500"
+    options:
+      sndwnd: 128
+      rcvwnd: 512
+      mtu: 1350
+
 # 日志配置
 log:
   level: "info"      # debug, info, warn, error
@@ -117,12 +134,14 @@ dns:
 # 路由配置
 routing:
   geoip: "/path/to/GeoLite2-Country.mmdb"
+  geosite: "/path/to/geosite.dat"
   remote_dns: "https://8.8.8.8/dns-query"
   upstreams:
     - "socks5://proxy1.example.com:1080"
     - "http://proxy2.example.com:8080"
   rules:
     - "direct: geoip:cn"
+    - "direct: geosite:cn"
     - "proxy: domain:google.com"
     - "proxy: domain:youtube.com"
     - "direct: cidr:192.168.0.0/16"
@@ -155,6 +174,78 @@ admin:
     enabled: false
     cert_file: ""
     key_file: ""
+
+# 用户管理配置 (Step 16 新增)
+users:
+  enabled: true
+  store_type: "sqlite"           # 存储类型：memory, sqlite
+  sqlite_path: "/var/lib/netproxy/users.db"
+  default_quota: 10737418240     # 默认流量配额（字节），10GB
+
+# 透明代理配置 (Step 16 新增)
+tproxy:
+  enabled: false
+  addr: ":12345"
+  mark: 1                        # Linux TPROXY 标记值
+  table: 100                     # 路由表编号
+
+# TUN 设备配置 (Step 16 新增)
+tun:
+  enabled: false
+  name: "utun8"
+  mtu: 1400
+  address: "10.0.0.1/24"
+  gateway: "10.0.0.1"
+  routes:                        # 需要添加的路由
+    - "0.0.0.0/0"
+
+# FakeDNS 配置 (Step 16 新增)
+fakedns:
+  enabled: false
+  ip_range: "198.18.0.0/16"      # IP 地址池范围
+  pool_size: 65535               # IP 池大小
+
+# ACME 证书配置 (Step 16 新增)
+acme:
+  enabled: false
+  email: "admin@example.com"
+  domains:
+    - "proxy.example.com"
+  cache_dir: "/var/lib/netproxy/certs"
+  directory_url: ""              # ACME 目录 URL，空则使用 Let's Encrypt
+  renew_before: "720h"           # 证书到期前多久续期（30天）
+  http_challenge: true           # 启用 HTTP-01 挑战
+  http_challenge_port: 80        # HTTP 挑战端口
+  tls_challenge: false           # 启用 TLS-ALPN-01 挑战
+  tls_challenge_port: 443        # TLS 挑战端口
+
+# 健康检查配置 (Step 16 新增)
+health:
+  enabled: true
+  interval: "30s"
+  default_timeout: "5s"          # 默认检查超时
+
+# 订阅更新配置 (Step 16 新增)
+subscription:
+  enabled: true
+  sources:                       # 订阅源列表
+    - name: "geoip"
+      type: "geoip"              # 类型：geoip, geosite, rules
+      url: "https://example.com/geoip.dat"
+      local_path: "/var/lib/netproxy/geoip.dat"
+      update_interval: "24h"
+      enabled: true
+    - name: "geosite"
+      type: "geosite"
+      url: "https://example.com/geosite.dat"
+      local_path: "/var/lib/netproxy/geosite.dat"
+      update_interval: "24h"
+      enabled: true
+
+# 指标配置 (Step 16 新增)
+metrics:
+  enabled: true
+  addr: ":9091"                  # Prometheus 指标端点地址
 ```
 
 ---
@@ -489,6 +580,264 @@ curl -H "X-Admin-Token: admin-secret-token" http://localhost:9090/stats
 # Prometheus 指标
 curl http://localhost:9090/metrics
 ```
+
+---
+
+### 用户管理配置 (users)
+
+多用户管理功能配置，支持内存存储和 SQLite 持久化存储。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用用户管理 |
+| `store_type` | string | `memory` | 存储类型：`memory`, `sqlite` |
+| `sqlite_path` | string | - | SQLite 数据库路径 |
+| `default_quota` | int64 | `0` | 默认流量配额（字节），0 表示无限制 |
+
+```yaml
+users:
+  enabled: true
+  store_type: "sqlite"
+  sqlite_path: "/var/lib/netproxy/users.db"
+  default_quota: 10737418240  # 10GB
+```
+
+#### 用户管理 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/v1/users` | GET | 列出所有用户 |
+| `/api/v1/users` | POST | 创建用户 |
+| `/api/v1/users/:id` | GET | 获取用户详情 |
+| `/api/v1/users/:id` | PUT | 更新用户 |
+| `/api/v1/users/:id` | DELETE | 删除用户 |
+| `/api/v1/users/:id/stats` | GET | 获取用户流量统计 |
+| `/api/v1/users/:id/reset` | POST | 重置用户流量 |
+
+**创建用户示例**：
+```bash
+curl -X POST -H "X-Admin-Token: token" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"user1","quota":10737418240}' \
+  http://localhost:9090/api/v1/users
+```
+
+---
+
+### 透明代理配置 (tproxy)
+
+透明代理功能配置，支持 Linux TPROXY 和 macOS pf。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用透明代理 |
+| `addr` | string | `:12345` | 透明代理监听地址 |
+| `mark` | int | `1` | Linux TPROXY 标记值 |
+| `table` | int | `100` | 路由表编号 |
+
+```yaml
+tproxy:
+  enabled: true
+  addr: ":12345"
+  mark: 1
+  table: 100
+```
+
+**Linux 配置脚本**：
+```bash
+# 使用提供的脚本配置 iptables
+./scripts/tproxy_setup.sh enable 12345
+```
+
+**macOS 配置脚本**：
+```bash
+# 使用提供的脚本配置 pf
+sudo ./scripts/pf_setup.sh enable 12345
+```
+
+---
+
+### TUN 设备配置 (tun)
+
+TUN 虚拟网卡配置，用于实现真正的 VPN 功能。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用 TUN 设备 |
+| `name` | string | `tun0` | TUN 设备名称 |
+| `mtu` | int | `1500` | MTU 大小 |
+| `address` | string | - | TUN 设备 IP 地址 |
+| `gateway` | string | - | 网关地址 |
+| `routes` | []string | - | 需要添加的路由列表 |
+
+```yaml
+tun:
+  enabled: true
+  name: "utun8"
+  mtu: 1400
+  address: "10.0.0.1/24"
+  gateway: "10.0.0.1"
+  routes:
+    - "0.0.0.0/0"
+```
+
+**注意**：TUN 设备需要 root/管理员权限。
+
+---
+
+### FakeDNS 配置 (fakedns)
+
+FakeDNS 功能配置，用于 TUN 模式下的域名解析。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用 FakeDNS |
+| `ip_range` | string | `198.18.0.0/16` | IP 地址池范围 |
+| `pool_size` | int | `65535` | IP 池大小 |
+
+```yaml
+fakedns:
+  enabled: true
+  ip_range: "198.18.0.0/16"
+  pool_size: 65535
+```
+
+---
+
+### ACME 证书配置 (acme)
+
+Let's Encrypt 自动证书管理配置。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用 ACME |
+| `email` | string | - | 注册邮箱 |
+| `domains` | []string | - | 证书域名列表 |
+| `cache_dir` | string | - | 证书缓存目录 |
+| `directory_url` | string | - | ACME 目录 URL，空则使用 Let's Encrypt |
+| `renew_before` | duration | `720h` | 证书到期前多久续期（30天） |
+| `http_challenge` | bool | `true` | 启用 HTTP-01 挑战 |
+| `http_challenge_port` | int | `80` | HTTP 挑战端口 |
+| `tls_challenge` | bool | `false` | 启用 TLS-ALPN-01 挑战 |
+| `tls_challenge_port` | int | `443` | TLS 挑战端口 |
+
+```yaml
+acme:
+  enabled: true
+  email: "admin@example.com"
+  domains:
+    - "proxy.example.com"
+    - "*.proxy.example.com"
+  cache_dir: "/var/lib/netproxy/certs"
+  directory_url: ""
+  renew_before: "720h"
+  http_challenge: true
+  http_challenge_port: 80
+  tls_challenge: false
+  tls_challenge_port: 443
+```
+
+---
+
+### 健康检查配置 (health)
+
+增强健康检查功能配置。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `true` | 是否启用健康检查 |
+| `interval` | duration | `30s` | 检查间隔 |
+| `default_timeout` | duration | `5s` | 默认检查超时 |
+
+```yaml
+health:
+  enabled: true
+  interval: "30s"
+  default_timeout: "5s"
+```
+
+#### 健康检查 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 简单健康检查 |
+| `/health/live` | GET | 存活检查 |
+| `/health/ready` | GET | 就绪检查 |
+| `/health/components` | GET | 组件健康状态 |
+
+---
+
+### 订阅更新配置 (subscription)
+
+规则订阅更新配置，用于自动更新 GeoIP/GeoSite 等规则文件。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用订阅更新 |
+| `sources` | []object | - | 订阅源列表 |
+
+#### 订阅源配置 (sources)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `name` | string | - | 订阅源名称 |
+| `type` | string | - | 类型：`geoip`, `geosite`, `rules` |
+| `url` | string | - | 远程 URL |
+| `local_path` | string | - | 本地保存路径 |
+| `update_interval` | duration | `24h` | 更新间隔 |
+| `enabled` | bool | `true` | 是否启用此订阅源 |
+
+```yaml
+subscription:
+  enabled: true
+  sources:
+    - name: "geoip"
+      type: "geoip"
+      url: "https://example.com/geoip.dat"
+      local_path: "/var/lib/netproxy/geoip.dat"
+      update_interval: "24h"
+      enabled: true
+    - name: "geosite"
+      type: "geosite"
+      url: "https://example.com/geosite.dat"
+      local_path: "/var/lib/netproxy/geosite.dat"
+      update_interval: "24h"
+      enabled: true
+```
+
+#### 订阅 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/v1/subscription/clash/:user_id` | GET | Clash 订阅 |
+| `/api/v1/subscription/v2ray/:user_id` | GET | V2Ray 订阅 |
+| `/api/v1/subscription/surge/:user_id` | GET | Surge 订阅 |
+
+---
+
+### 指标配置 (metrics)
+
+Prometheus 指标导出配置。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `true` | 是否启用指标 |
+| `addr` | string | `:9091` | Prometheus 指标端点地址 |
+
+```yaml
+metrics:
+  enabled: true
+  addr: ":9091"
+```
+
+#### 指标 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/v1/metrics/overview` | GET | 系统概览 |
+| `/api/v1/metrics/protocols` | GET | 协议统计 |
+| `/api/v1/metrics/users` | GET | 用户流量统计 |
+| `/metrics` | GET | Prometheus 格式指标 |
 
 ---
 
